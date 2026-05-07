@@ -51,7 +51,7 @@ def gf2_apply_cnot(parity: torch.Tensor, src: int, dst: int) -> torch.Tensor:
     return out
 
 
-def _apply_edge_index(parity: torch.Tensor, edge_index: torch.Tensor, edge_idx: int) -> torch.Tensor:
+def apply_edge_index(parity: torch.Tensor, edge_index: torch.Tensor, edge_idx: int) -> torch.Tensor:
     """对 parity 施加 edge_index 第 edge_idx 列对应的有向 CNOT。"""
     i = int(edge_index[0, edge_idx].item())
     j = int(edge_index[1, edge_idx].item())
@@ -121,9 +121,9 @@ def make_deterministic_label_samples(
             e_t = edge_sequence[t]
             if observation == "pre_action":
                 maybe_add(p, e_t)
-                p = _apply_edge_index(p, edge_index, e_t)
+                p = apply_edge_index(p, edge_index, e_t)
             else:
-                p = _apply_edge_index(p, edge_index, e_t)
+                p = apply_edge_index(p, edge_index, e_t)
                 maybe_add(p, e_t)
 
     if enumerate_all_paths:

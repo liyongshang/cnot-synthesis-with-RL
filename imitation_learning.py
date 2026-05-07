@@ -18,7 +18,10 @@
 - 训练默认从 **`data/imitation_ring_n5_wl2_post_pm.pt`** 读取；不存在则生成并保存。
   强制重建：``python imitation_learning.py --regenerate``。
 
-用法：运行 `train_imitation_demo()` 或 ``python imitation_learning.py``。
+用法：运行 `train_imitation_demo()` 或 ``python imitation_learning.py``（训练结束会保存权重到
+``checkpoints/imitation_policy.pt``，可用 ``--checkpoint`` 指定路径）。
+
+交互演示：训练后运行 ``python demo.py`` 加载权重，按提示输入 parity；或使用 ``python demo.py --random``。
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ from deterministic_samples import (
 
 
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "data" / "imitation_ring_n5_wl2_post_pm.pt"
+DEFAULT_CHECKPOINT_PATH = Path(__file__).resolve().parent / "checkpoints" / "imitation_policy.pt"
 
 
 def bidirectional_ring_edge_index(
@@ -134,6 +138,10 @@ class ImitationPolicy(nn.Module):
     ) -> None:
         super().__init__()
         self.n_qubits = n_qubits
+        self.node_dim = node_dim
+        self.edge_dim = edge_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         self.register_buffer("edge_index", edge_index.clone().long())
         self.register_buffer("target_parity", torch.eye(n_qubits, dtype=torch.float32))
 
@@ -182,6 +190,62 @@ def roll_out_demonstrations(
     return samples
 
 
+def save_imitation_policy(
+    path: str | Path,
+    model: ImitationPolicy,
+    *,
+    extra_meta: dict | None = None,
+) -> None:
+    """保存策略权重与构图配置（含 ``edge_index``），供 ``load_imitation_policy`` 还原。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "state_dict": model.state_dict(),
+        "config": {
+            "n_qubits": model.n_qubits,
+            "node_dim": model.node_dim,
+            "edge_dim": model.edge_dim,
+            "hidden_dim": model.hidden_dim,
+            "num_layers": model.num_layers,
+            "edge_index": model.edge_index.detach().cpu().long(),
+        },
+        "extra": extra_meta or {},
+    }
+    torch.save(payload, path)
+
+
+def load_imitation_policy(
+    path: str | Path,
+    map_location: str | torch.device | None = None,
+) -> tuple[ImitationPolicy, dict]:
+    """
+    加载 ``save_imitation_policy`` 保存的检查点。
+
+    返回 ``(model, payload)``，``payload`` 含 ``config``、``extra`` 等元数据。
+    """
+    path = Path(path)
+    device = map_location if isinstance(map_location, torch.device) else torch.device(
+        map_location or "cpu"
+    )
+    blob = torch.load(path, map_location=device)
+    if blob.get("format_version") != 1:
+        raise ValueError(f"unsupported checkpoint format_version {blob.get('format_version')}")
+    cfg = blob["config"]
+    edge_index = cfg["edge_index"].to(device=device)
+    model = ImitationPolicy(
+        n_qubits=int(cfg["n_qubits"]),
+        edge_index=edge_index,
+        node_dim=int(cfg["node_dim"]),
+        edge_dim=int(cfg["edge_dim"]),
+        hidden_dim=int(cfg["hidden_dim"]),
+        num_layers=int(cfg["num_layers"]),
+    ).to(device)
+    model.load_state_dict(blob["state_dict"])
+    model.eval()
+    return model, blob
+
+
 def behaviour_cloning_loss(logits: torch.Tensor, expert_edge_idx: torch.Tensor) -> torch.Tensor:
     """
     logits: [E, 1]，expert_edge_idx: 标量 0..E-1
@@ -213,6 +277,7 @@ def train_imitation_demo(
     *,
     dataset_path: Path | None = None,
     regenerate: bool = False,
+    checkpoint_path: Path | None = None,
 ) -> None:
     torch.manual_seed(seed)
     device = device or torch.device("cpu")
@@ -295,6 +360,14 @@ def train_imitation_demo(
     else:
         print("Not fully fitted: try more epochs, larger lr, or wider hidden_dim.")
 
+    ckpt = checkpoint_path if checkpoint_path is not None else DEFAULT_CHECKPOINT_PATH
+    save_imitation_policy(
+        ckpt,
+        model,
+        extra_meta={"dataset_path": str(dataset_path), "final_acc": float(final_acc)},
+    )
+    print(f"saved policy checkpoint -> {ckpt}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BC demo; loads saved deterministic samples by default.")
@@ -309,6 +382,16 @@ if __name__ == "__main__":
         default=None,
         help=f"path to .pt dataset (default: {DEFAULT_DATASET_PATH})",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help=f"where to save trained weights (default: {DEFAULT_CHECKPOINT_PATH})",
+    )
     args = parser.parse_args()
-    train_imitation_demo(dataset_path=args.dataset, regenerate=args.regenerate)
+    train_imitation_demo(
+        dataset_path=args.dataset,
+        regenerate=args.regenerate,
+        checkpoint_path=args.checkpoint,
+    )
 
