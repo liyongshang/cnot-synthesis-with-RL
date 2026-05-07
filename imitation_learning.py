@@ -63,6 +63,28 @@ def bidirectional_ring_edge_index(
     return torch.tensor([src_list, dst_list], dtype=torch.long, device=dev)
 
 
+def bidirectional_line_edge_index(
+    n_qubits: int,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """
+    双向线性链：顶点 0—1—…—N−1，仅在相邻比特间有无向连接；
+    每条无向边展开为两条有向边 (i→j) 与 (j→i)。
+
+    返回 edge_index，形状 [2, E]，E = 2 * (N − 1)（N ≥ 2）。
+    """
+    if n_qubits < 2:
+        raise ValueError("linear topology requires n_qubits >= 2")
+    dev = device or torch.device("cpu")
+    src_list: list[int] = []
+    dst_list: list[int] = []
+    for i in range(n_qubits - 1):
+        j = i + 1
+        src_list.extend([i, j])
+        dst_list.extend([j, i])
+    return torch.tensor([src_list, dst_list], dtype=torch.long, device=dev)
+
+
 def edge_pair_to_index(edge_index: torch.Tensor, src: int, dst: int) -> int:
     """将 (src, dst) 映射到唯一列下标；不存在则抛错。"""
     src_r = edge_index[0]

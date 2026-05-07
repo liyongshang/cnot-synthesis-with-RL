@@ -151,6 +151,7 @@ def save_deterministic_dataset(
     dedupe_mode: str,
     enumerate_all_paths: bool,
     num_random_trajectories: int | None = None,
+    topology: str | None = None,
 ) -> None:
     """
     将样本存为 ``.pt``：堆叠 parity 为 ``[N, n, n]``，标签为 ``[N]`` long，
@@ -174,6 +175,8 @@ def save_deterministic_dataset(
         "edge_index": edge_index.detach().cpu().long(),
         "num_samples": len(samples),
     }
+    if topology is not None:
+        meta["topology"] = topology
     torch.save({"meta": meta, "parity_tensors": mats, "edge_labels": labels}, path)
 
 
