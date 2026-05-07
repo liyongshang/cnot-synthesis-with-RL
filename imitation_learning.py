@@ -18,10 +18,12 @@
 - 训练默认从 **`data/imitation_ring_n5_wl2_post_pm.pt`** 读取；不存在则生成并保存。
   强制重建：``python imitation_learning.py --regenerate``。
 
-用法：运行 `train_imitation_demo()` 或 ``python imitation_learning.py``（训练结束会保存权重到
-``checkpoints/imitation_policy.pt``，可用 ``--checkpoint`` 指定路径）。
+用法：运行 `train_imitation_demo()` 或 ``python imitation_learning.py``（默认 **walk_length=2** 数据，
+**随机 90% 训练 / 10% 测试**，并在 **acc_train / acc_test** 达到阈值且 epoch≥``min_epochs`` 时 **早停**）。
 
-交互演示：训练后运行 ``python demo.py`` 加载权重，按提示输入 parity；或使用 ``python demo.py --random``。
+训练结束保存权重到 ``checkpoints/imitation_policy.pt``（``--checkpoint`` 可改路径）。
+
+交互演示：``python demo.py``。
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
 
 from agent import CNOTPolicyNet, ParityEdgeFeatEncoder
 from deterministic_samples import (
@@ -44,7 +47,9 @@ from deterministic_samples import (
 
 
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "data" / "imitation_ring_n5_wl2_post_pm.pt"
+DEFAULT_WL7_DATASET_PATH = Path(__file__).resolve().parent / "data" / "line_n5_wl7_post_pm.pt"
 DEFAULT_CHECKPOINT_PATH = Path(__file__).resolve().parent / "checkpoints" / "imitation_policy.pt"
+DEFAULT_WL7_CHECKPOINT_PATH = Path(__file__).resolve().parent / "checkpoints" / "imitation_policy_wl7.pt"
 
 
 def bidirectional_ring_edge_index(
@@ -112,10 +117,20 @@ class StateTargetRowEncoder(nn.Module):
         self.proj = nn.Linear(2 * n_qubits, node_dim)
 
     def forward(self, target_parity: torch.Tensor, current_parity: torch.Tensor) -> torch.Tensor:
-        if target_parity.shape != (self.n_qubits, self.n_qubits):
-            raise ValueError(f"target_parity 期望 [{self.n_qubits},{self.n_qubits}]")
-        if current_parity.shape != target_parity.shape:
-            raise ValueError("current_parity 形状须与 target_parity 一致")
+        if target_parity.dim() == 2:
+            if target_parity.shape != (self.n_qubits, self.n_qubits):
+                raise ValueError(f"target_parity 期望 [{self.n_qubits},{self.n_qubits}]")
+            if current_parity.shape != target_parity.shape:
+                raise ValueError("current_parity 形状须与 target_parity 一致")
+        elif target_parity.dim() == 3:
+            if target_parity.shape[1:] != (self.n_qubits, self.n_qubits):
+                raise ValueError(
+                    f"target_parity 期望 [B,{self.n_qubits},{self.n_qubits}]"
+                )
+            if current_parity.shape != target_parity.shape:
+                raise ValueError("current_parity 形状须与 target_parity 一致")
+        else:
+            raise ValueError("target_parity 须为 [N,N] 或 [B,N,N]")
         t = target_parity.to(dtype=torch.float32, device=self.proj.weight.device)
         p = current_parity.to(dtype=torch.float32, device=self.proj.weight.device)
         rows = torch.cat([t, p], dim=-1)
@@ -155,10 +170,49 @@ class ImitationPolicy(nn.Module):
             use_value_head=False,
         )
 
+    def forward_batched(self, current_parity: torch.Tensor) -> torch.Tensor:
+        """
+        一批样本共享同一 target=I 与 edge_index；用 disjoint union 拼成大图一次前向。
+        current_parity: [B, N, N] -> logits [B, E, 1]
+        """
+        if current_parity.dim() != 3:
+            raise ValueError(f"forward_batched 需要 [B,N,N]，得到 {tuple(current_parity.shape)}")
+        b, n, _ = current_parity.shape
+        if n != self.n_qubits:
+            raise ValueError(f"N={n} 与 n_qubits={self.n_qubits} 不一致")
+        device = current_parity.device
+        dtype = current_parity.dtype
+        target = self.target_parity.to(device=device, dtype=dtype).unsqueeze(0).expand(b, -1, -1)
+        node_feat = self.node_enc(target, current_parity)  # [B, N, node_dim]
+        edge_feat = self.edge_enc(target, self.edge_index, current_parity)  # [B, E, edge_dim]
+        e_cnt = int(self.edge_index.size(1))
+        node_flat = node_feat.reshape(b * n, -1)
+        ei = disjoint_batch_edge_index(self.edge_index, n, b, device=device)
+        ef_flat = edge_feat.reshape(b * e_cnt, -1)
+        logits_flat = self.policy(node_flat, ei, ef_flat)  # [B*E, 1]
+        return logits_flat.view(b, e_cnt, 1)
+
     def forward(self, current_parity: torch.Tensor) -> torch.Tensor:
-        node_feat = self.node_enc(self.target_parity, current_parity)
-        edge_feat = self.edge_enc(self.target_parity, self.edge_index, current_parity)
-        return self.policy(node_feat, self.edge_index, edge_feat)
+        if current_parity.dim() != 2:
+            raise ValueError(f"单样本 forward 需要 [N,N]，得到 {tuple(current_parity.shape)}")
+        return self.forward_batched(current_parity.unsqueeze(0)).squeeze(0)
+
+
+def disjoint_batch_edge_index(
+    edge_index: torch.Tensor,
+    n_nodes: int,
+    batch_size: int,
+    *,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """同一拓扑重复 batch_size 次，节点编号加上 0, N, 2N, … 偏移，得到 [2, batch_size*E]。"""
+    dev = device or edge_index.device
+    ei = edge_index.to(device=dev)
+    off = (
+        torch.arange(batch_size, device=dev, dtype=ei.dtype).view(batch_size, 1, 1) * int(n_nodes)
+    )
+    stacked = ei.unsqueeze(0).expand(batch_size, -1, -1) + off
+    return stacked.reshape(2, batch_size * edge_index.size(1))
 
 
 def roll_out_demonstrations(
@@ -255,43 +309,97 @@ def behaviour_cloning_loss(logits: torch.Tensor, expert_edge_idx: torch.Tensor) 
     return F.cross_entropy(log, target)
 
 
+def behaviour_cloning_loss_batched(
+    logits: torch.Tensor,
+    expert_edge_idx: torch.Tensor,
+) -> torch.Tensor:
+    """logits: [B, E, 1]；expert_edge_idx: [B]，类别为边下标。"""
+    log = logits.squeeze(-1)
+    return F.cross_entropy(log, expert_edge_idx.long())
+
+
+def split_train_test(
+    samples: list[tuple[torch.Tensor, int]],
+    train_ratio: float,
+    seed: int,
+) -> tuple[list[tuple[torch.Tensor, int]], list[tuple[torch.Tensor, int]]]:
+    """随机打乱后按比例划分训练集 / 测试集（用于泛化评估）。"""
+    if not (0.0 < train_ratio < 1.0):
+        raise ValueError("train_ratio must be in (0, 1)")
+    n = len(samples)
+    if n < 2:
+        raise ValueError("need at least 2 samples to split")
+    g = torch.Generator()
+    g.manual_seed(seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    shuffled = [samples[i] for i in perm]
+    # e.g. n=71, ratio=0.9 -> round(63.9)=64 train, 7 test
+    n_train = max(1, min(int(round(n * train_ratio)), n - 1))
+    train_samples = shuffled[:n_train]
+    test_samples = shuffled[n_train:]
+    return train_samples, test_samples
+
+
 @torch.no_grad()
 def edge_classification_accuracy(
     model: ImitationPolicy,
     samples: list[tuple[torch.Tensor, int]],
     device: torch.device,
+    batch_size: int = 512,
 ) -> float:
+    n = len(samples)
+    if n == 0:
+        return 0.0
     correct = 0
-    for cur, expert_idx in samples:
-        cur = cur.to(device)
-        logits = model(cur)
-        pred = int(logits.squeeze(-1).argmax().item())
-        if pred == expert_idx:
-            correct += 1
-    return correct / max(len(samples), 1)
+    for start in range(0, n, batch_size):
+        chunk = samples[start : start + batch_size]
+        cur = torch.stack([c for c, _ in chunk]).to(device)
+        y = torch.tensor([e for _, e in chunk], device=device, dtype=torch.long)
+        logits = model.forward_batched(cur)
+        pred = logits.squeeze(-1).argmax(dim=-1)
+        correct += int((pred == y).sum().item())
+    return correct / n
+
+
+def _resolve_training_device(device: torch.device | str | None) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    if device is None or str(device) == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(str(device))
 
 
 def train_imitation_demo(
-    device: torch.device | None = None,
+    device: torch.device | str | None = None,
     seed: int = 0,
     *,
     dataset_path: Path | None = None,
     regenerate: bool = False,
     checkpoint_path: Path | None = None,
+    train_ratio: float = 0.9,
+    split_seed: int | None = None,
+    max_epochs: int = 120,
+    early_stop: bool = True,
+    min_epochs: int = 5,
+    stop_acc_train: float = 0.999,
+    stop_acc_test: float = 0.99,
+    batch_size: int = 128,
+    use_amp: bool = True,
+    eval_batch_size: int = 512,
 ) -> None:
     torch.manual_seed(seed)
-    device = device or torch.device("cpu")
+    resolved = _resolve_training_device(device)
     dataset_path = dataset_path or DEFAULT_DATASET_PATH
 
-    n = 5
+    n_ring = 5
     walk_len = 2
     obs_mode = "post_action"
     dedupe = "parity_matrix"
 
     if regenerate or not dataset_path.is_file():
-        edge_index_cpu = bidirectional_ring_edge_index(n, device=torch.device("cpu"))
+        edge_index_cpu = bidirectional_ring_edge_index(n_ring, device=torch.device("cpu"))
         ring_samples = make_deterministic_label_samples(
-            n,
+            n_ring,
             edge_index_cpu,
             walk_length=walk_len,
             observation=obs_mode,
@@ -302,7 +410,7 @@ def train_imitation_demo(
             dataset_path,
             ring_samples,
             edge_index=edge_index_cpu,
-            n_qubits=n,
+            n_qubits=n_ring,
             walk_length=walk_len,
             observation=obs_mode,
             dedupe_mode=dedupe,
@@ -311,18 +419,30 @@ def train_imitation_demo(
         )
         print(f"wrote dataset -> {dataset_path}")
 
-    meta, ring_samples = load_deterministic_dataset(dataset_path, map_location=device)
-    edge_index = meta["edge_index"].to(device=device)
-    n_meta = int(meta["n_qubits"])
-    assert n_meta == n, "dataset n_qubits mismatch"
-    e_cnt = edge_index.size(1)
-    assert e_cnt == 2 * n, "5 比特双向环应有 E = 10 条有向边"
+    meta, ring_samples = load_deterministic_dataset(dataset_path, map_location=resolved)
+    edge_index = meta["edge_index"].to(device=resolved)
+    n = int(meta["n_qubits"])
+    e_cnt = int(edge_index.size(1))
+    walk_meta = int(meta.get("walk_length", walk_len))
+
+    use_amp_eff = bool(use_amp and resolved.type == "cuda")
+    scaler = GradScaler(enabled=use_amp_eff)
 
     n_s, n_u = dataset_parity_stats(ring_samples)
     print(f"loaded dataset {dataset_path}")
-    print(f"bidirectional ring  E={e_cnt}  walk_length={meta.get('walk_length')}")
+    print(
+        f"  device={resolved}  batch_size={batch_size}  amp={use_amp_eff}  "
+        f"E={e_cnt}  n_qubits={n}  walk_length={walk_meta}"
+    )
     print(f"  samples={n_s}  unique_matrices={n_u}")
     print("edge_index [src; dst]:", edge_index.cpu().tolist())
+
+    split_s = split_seed if split_seed is not None else seed + 2025
+    train_samples, test_samples = split_train_test(ring_samples, train_ratio, split_s)
+    print(
+        f"train/test split  ratio={train_ratio:.0%}  seed={split_s}  "
+        f"|train|={len(train_samples)}  |test|={len(test_samples)}"
+    )
 
     model = ImitationPolicy(
         n_qubits=n,
@@ -331,40 +451,103 @@ def train_imitation_demo(
         edge_dim=16,
         hidden_dim=64,
         num_layers=3,
-    ).to(device)
+    ).to(resolved)
     opt = torch.optim.Adam(model.parameters(), lr=3e-3)
 
-    epochs = 120
-    for ep in range(epochs):
+    stopped_early = False
+    completed_epochs = 0
+    shuf = torch.Generator(device="cpu")
+    for ep in range(max_epochs):
+        shuf.manual_seed(seed + ep * 10007)
+        perm = torch.randperm(len(train_samples), generator=shuf).tolist()
         total_loss = 0.0
-        for cur, expert_idx in ring_samples:
-            cur = cur.to(device)
-            target_lbl = torch.tensor(expert_idx, device=device, dtype=torch.long)
-            logits = model(cur)
-            loss = behaviour_cloning_loss(logits, target_lbl)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+        n_batches = 0
+        for start in range(0, len(train_samples), batch_size):
+            idx = perm[start : start + batch_size]
+            batch_cur = torch.stack([train_samples[i][0] for i in idx]).to(resolved)
+            batch_y = torch.tensor(
+                [train_samples[i][1] for i in idx],
+                device=resolved,
+                dtype=torch.long,
+            )
+            opt.zero_grad(set_to_none=True)
+            with autocast(enabled=use_amp_eff):
+                logits = model.forward_batched(batch_cur)
+                loss = behaviour_cloning_loss_batched(logits, batch_y)
+            if use_amp_eff:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
             total_loss += loss.item()
+            n_batches += 1
 
-        acc = edge_classification_accuracy(model, ring_samples, device)
-        avg_loss = total_loss / len(ring_samples)
-        if (ep + 1) % 10 == 0 or ep == 0:
-            print(f"epoch {ep + 1}/{epochs}  loss={avg_loss:.4f}  acc_on_ring_set={acc:.3f}")
+        acc_tr = edge_classification_accuracy(
+            model, train_samples, resolved, batch_size=eval_batch_size
+        )
+        acc_te = edge_classification_accuracy(
+            model, test_samples, resolved, batch_size=eval_batch_size
+        )
+        avg_loss = total_loss / max(n_batches, 1)
+        completed_epochs = ep + 1
+        if completed_epochs % 10 == 0 or ep == 0:
+            print(
+                f"epoch {completed_epochs}/{max_epochs}  loss={avg_loss:.4f}  "
+                f"acc_train={acc_tr:.3f}  acc_test={acc_te:.3f}"
+            )
 
-    final_acc = edge_classification_accuracy(model, ring_samples, device)
+        if (
+            early_stop
+            and completed_epochs >= min_epochs
+            and acc_tr >= stop_acc_train
+            and acc_te >= stop_acc_test
+        ):
+            print(
+                f"early stop at epoch {completed_epochs}: "
+                f"acc_train={acc_tr:.3f}>={stop_acc_train}  "
+                f"acc_test={acc_te:.3f}>={stop_acc_test}"
+            )
+            stopped_early = True
+            break
+
+    final_acc_train = edge_classification_accuracy(
+        model, train_samples, resolved, batch_size=eval_batch_size
+    )
+    final_acc_test = edge_classification_accuracy(
+        model, test_samples, resolved, batch_size=eval_batch_size
+    )
     print("---")
-    print(f"final acc on ring deterministic set (train=all) = {final_acc:.3f}")
-    if final_acc >= 0.999:
-        print("OK: converged on this dataset (near-zero CE on all ring samples).")
+    print(
+        f"final acc_train={final_acc_train:.3f}  acc_test={final_acc_test:.3f}  "
+        f"(walk_length={walk_meta}, epochs={completed_epochs}"
+        f"{' early_stop' if stopped_early else ''})"
+    )
+    if final_acc_train >= 0.999:
+        print("OK: training set nearly fitted.")
     else:
-        print("Not fully fitted: try more epochs, larger lr, or wider hidden_dim.")
+        print("Training set not fully fitted; consider more epochs.")
 
     ckpt = checkpoint_path if checkpoint_path is not None else DEFAULT_CHECKPOINT_PATH
     save_imitation_policy(
         ckpt,
         model,
-        extra_meta={"dataset_path": str(dataset_path), "final_acc": float(final_acc)},
+        extra_meta={
+            "dataset_path": str(dataset_path),
+            "final_acc_train": float(final_acc_train),
+            "final_acc_test": float(final_acc_test),
+            "train_ratio": float(train_ratio),
+            "split_seed": int(split_s),
+            "walk_length": walk_meta,
+            "epochs_completed": int(completed_epochs),
+            "early_stopped": bool(stopped_early),
+            "max_epochs": int(max_epochs),
+            "train_batch_size": int(batch_size),
+            "eval_batch_size": int(eval_batch_size),
+            "device": str(resolved),
+            "use_amp": bool(use_amp_eff),
+        },
     )
     print(f"saved policy checkpoint -> {ckpt}")
 
@@ -388,10 +571,82 @@ if __name__ == "__main__":
         default=None,
         help=f"where to save trained weights (default: {DEFAULT_CHECKPOINT_PATH})",
     )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.9,
+        help="fraction of samples for training (rest for test generalization)",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=None,
+        help="seed for train/test shuffle (default: train seed + 2025)",
+    )
+    parser.add_argument("--max-epochs", type=int, default=120, help="upper bound on training epochs")
+    parser.add_argument(
+        "--no-early-stop",
+        action="store_true",
+        help="disable convergence early stopping (always run --max-epochs)",
+    )
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=5,
+        help="minimum epochs before early stop can trigger",
+    )
+    parser.add_argument(
+        "--stop-acc-train",
+        type=float,
+        default=0.999,
+        help="early stop when acc_train reaches this (and test threshold)",
+    )
+    parser.add_argument(
+        "--stop-acc-test",
+        type=float,
+        default=0.99,
+        help="early stop when acc_test reaches this (with --stop-acc-train)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="训练设备：cpu | cuda | cuda:0 | auto（默认自动选 CUDA）",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=128,
+        help="训练 mini-batch 大小（GPU 上可调大以提升利用率）",
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=512,
+        help="评估准确率时的 batch 大小",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="关闭 CUDA 混合精度（默认在 CUDA 上开启 autocast + GradScaler）",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="随机种子（数据打乱、训练洗牌）")
     args = parser.parse_args()
     train_imitation_demo(
+        device=args.device,
+        seed=args.seed,
         dataset_path=args.dataset,
         regenerate=args.regenerate,
         checkpoint_path=args.checkpoint,
+        train_ratio=args.train_ratio,
+        split_seed=args.split_seed,
+        max_epochs=args.max_epochs,
+        early_stop=not args.no_early_stop,
+        min_epochs=args.min_epochs,
+        stop_acc_train=args.stop_acc_train,
+        stop_acc_test=args.stop_acc_test,
+        batch_size=args.batch_size,
+        use_amp=not args.no_amp,
+        eval_batch_size=args.eval_batch_size,
     )
 

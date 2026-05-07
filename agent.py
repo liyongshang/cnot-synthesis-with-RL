@@ -143,17 +143,24 @@ class ParityEdgeFeatEncoder(nn.Module):
         """Mean Hamming distance per row pair, shape [...]."""
         return (a.to(torch.float32) != b.to(torch.float32)).float().mean(dim=-1)
 
-    def _raw_edge_vectors(
+    def _raw_edge_vectors_impl(
         self,
         target_parity: torch.Tensor,
         edge_index: torch.Tensor,
         current_parity: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Returns [E, raw_dim] float features (pad/truncate to raw_dim)."""
+        """
+        Batched core: target_parity [B, N, N], optional current_parity [B, N, N].
+        Returns [B, E, raw_dim] (before squeeze for B=1 single-graph path).
+        """
         src = edge_index[0].long()
         dst = edge_index[1].long()
+        e_cnt = edge_index.size(1)
         t = target_parity.to(torch.float32)
-        Ts, Td = t[src], t[dst]  # [E, N]
+        B = t.shape[0]
+        device = t.device
+        Ts = t[:, src, :]  # [B, E, N]
+        Td = t[:, dst, :]
 
         raw_list = [
             gf2_dot(Ts, Td),
@@ -164,7 +171,8 @@ class ParityEdgeFeatEncoder(nn.Module):
 
         if current_parity is not None:
             p = current_parity.to(torch.float32)
-            Ps, Pd = p[src], p[dst]
+            Ps = p[:, src, :]
+            Pd = p[:, dst, :]
             raw_list.extend(
                 [
                     self._ham_norm(Ps, Ts),
@@ -174,17 +182,13 @@ class ParityEdgeFeatEncoder(nn.Module):
                 ]
             )
         else:
-            raw_list.extend(
-                [
-                    torch.zeros(edge_index.size(1), device=t.device, dtype=torch.float32)
-                    for _ in range(4)
-                ]
-            )
+            z = torch.zeros(B, e_cnt, device=device, dtype=torch.float32)
+            raw_list.extend([z, z, z, z])
 
-        raw = torch.stack(raw_list, dim=-1)  # [E, 8] when len(raw_list)==8
+        raw = torch.stack(raw_list, dim=-1)  # [B, E, L]
         if raw.size(-1) < self.raw_dim:
             pad = torch.zeros(
-                raw.size(0),
+                *raw.shape[:-1],
                 self.raw_dim - raw.size(-1),
                 device=raw.device,
                 dtype=raw.dtype,
@@ -200,13 +204,31 @@ class ParityEdgeFeatEncoder(nn.Module):
         edge_index: torch.Tensor,
         current_parity: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if target_parity.shape != (self.n_qubits, self.n_qubits):
+        if target_parity.dim() == 2:
+            if target_parity.shape != (self.n_qubits, self.n_qubits):
+                raise ValueError(
+                    f"target_parity must be [{self.n_qubits}, {self.n_qubits}], got {tuple(target_parity.shape)}"
+                )
+            if current_parity is not None and current_parity.shape != target_parity.shape:
+                raise ValueError("current_parity must match target_parity shape when provided.")
+            raw = self._raw_edge_vectors_impl(
+                target_parity.unsqueeze(0),
+                edge_index,
+                current_parity.unsqueeze(0) if current_parity is not None else None,
+            ).squeeze(0)
+        elif target_parity.dim() == 3:
+            if target_parity.shape[1:] != (self.n_qubits, self.n_qubits):
+                raise ValueError(
+                    f"target_parity must be [B, {self.n_qubits}, {self.n_qubits}], got {tuple(target_parity.shape)}"
+                )
+            if current_parity is not None:
+                if current_parity.shape != target_parity.shape:
+                    raise ValueError("current_parity must match target_parity shape when provided.")
+            raw = self._raw_edge_vectors_impl(target_parity, edge_index, current_parity)
+        else:
             raise ValueError(
-                f"target_parity must be [{self.n_qubits}, {self.n_qubits}], got {tuple(target_parity.shape)}"
+                f"target_parity must be [N,N] or [B,N,N], got dim={target_parity.dim()}"
             )
-        if current_parity is not None and current_parity.shape != target_parity.shape:
-            raise ValueError("current_parity must match target_parity shape when provided.")
-        raw = self._raw_edge_vectors(target_parity, edge_index, current_parity)
         return self.proj(raw)
 
 
