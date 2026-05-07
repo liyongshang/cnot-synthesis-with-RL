@@ -212,7 +212,11 @@ def disjoint_batch_edge_index(
         torch.arange(batch_size, device=dev, dtype=ei.dtype).view(batch_size, 1, 1) * int(n_nodes)
     )
     stacked = ei.unsqueeze(0).expand(batch_size, -1, -1) + off
-    return stacked.reshape(2, batch_size * edge_index.size(1))
+    # 不可对 [B,2,E] 直接 reshape(2, B*E)：会把同一图的 src/dst 行交错打乱。
+    # 正确顺序：先沿 batch 串接每条边对应的 src，再串接 dst（与 edge_feat [B,E,*] 展平一致）。
+    src_flat = stacked[:, 0, :].reshape(-1)
+    dst_flat = stacked[:, 1, :].reshape(-1)
+    return torch.stack([src_flat, dst_flat], dim=0)
 
 
 def roll_out_demonstrations(
