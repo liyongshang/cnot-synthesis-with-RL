@@ -37,16 +37,20 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 
 from agent import CNOTPolicyNet, ParityEdgeFeatEncoder
+from collections import defaultdict
+
 from deterministic_samples import (
     dataset_parity_stats,
     gf2_apply_cnot,
+    label_ambiguity_stats,
     load_deterministic_dataset,
     make_deterministic_label_samples,
+    parity_matrix_key,
     save_deterministic_dataset,
 )
 
 
-DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "data" / "imitation_ring_n5_wl2_post_pm.pt"
+DEFAULT_DATASET_PATH = Path(__file__).resolve().parent / "data" / "line_n5_wl2_post_pm_mindepth.pt"
 DEFAULT_WL7_DATASET_PATH = Path(__file__).resolve().parent / "data" / "line_n5_wl7_post_pm.pt"
 DEFAULT_CHECKPOINT_PATH = Path(__file__).resolve().parent / "checkpoints" / "imitation_policy.pt"
 DEFAULT_WL7_CHECKPOINT_PATH = Path(__file__).resolve().parent / "checkpoints" / "imitation_policy_wl7.pt"
@@ -322,6 +326,40 @@ def behaviour_cloning_loss_batched(
     return F.cross_entropy(log, expert_edge_idx.long())
 
 
+def valid_edges_frozenset_by_matrix(
+    samples: list[tuple[torch.Tensor, int]],
+) -> dict[tuple[int, ...], frozenset[int]]:
+    """同一 parity 矩阵对应的所有合法有向边下标（合并多条样本行）。"""
+    g: defaultdict[tuple[int, ...], set[int]] = defaultdict(set)
+    for p, e in samples:
+        g[parity_matrix_key(p)].add(int(e))
+    return {k: frozenset(v) for k, v in g.items()}
+
+
+def behaviour_cloning_loss_multi_valid(
+    logits: torch.Tensor,
+    parity_batch: torch.Tensor,
+    valid_by_pk: dict[tuple[int, ...], frozenset[int]],
+) -> torch.Tensor:
+    """
+    多个合法边时：最大化 ``sum_{e in Valid(P)} softmax(z)_e``（任一合法即可），
+    即最小化 ``-(logsumexp(z_V) - logsumexp(z))``。
+    若某矩阵仅一条合法边，退化为普通交叉熵。
+    """
+    z = logits.squeeze(-1)
+    device = z.device
+    B = z.size(0)
+    parts: list[torch.Tensor] = []
+    for i in range(B):
+        pk = parity_matrix_key(parity_batch[i])
+        valid = valid_by_pk[pk]
+        idx = torch.tensor(sorted(valid), device=device, dtype=torch.long)
+        logz_all = torch.logsumexp(z[i], dim=0)
+        logz_v = torch.logsumexp(z[i].index_select(0, idx), dim=0)
+        parts.append(-(logz_v - logz_all))
+    return torch.stack(parts).mean()
+
+
 def split_train_test(
     samples: list[tuple[torch.Tensor, int]],
     train_ratio: float,
@@ -365,6 +403,32 @@ def edge_classification_accuracy(
     return correct / n
 
 
+@torch.no_grad()
+def edge_classification_accuracy_multi(
+    model: ImitationPolicy,
+    samples: list[tuple[torch.Tensor, int]],
+    device: torch.device,
+    valid_by_pk: dict[tuple[int, ...], frozenset[int]],
+    batch_size: int = 512,
+) -> float:
+    """预测边属于该 parity 在集合中的任一边即判对。"""
+    n = len(samples)
+    if n == 0:
+        return 0.0
+    correct = 0
+    for start in range(0, n, batch_size):
+        chunk = samples[start : start + batch_size]
+        cur = torch.stack([c for c, _ in chunk]).to(device)
+        logits = model.forward_batched(cur)
+        pred = logits.squeeze(-1).argmax(dim=-1)
+        for j in range(cur.size(0)):
+            pk = parity_matrix_key(cur[j])
+            valid = valid_by_pk.get(pk, frozenset())
+            if int(pred[j].item()) in valid:
+                correct += 1
+    return correct / n
+
+
 def _resolve_training_device(device: torch.device | str | None) -> torch.device:
     if isinstance(device, torch.device):
         return device
@@ -398,7 +462,7 @@ def train_imitation_demo(
     n_ring = 5
     walk_len = 2
     obs_mode = "post_action"
-    dedupe = "parity_matrix"
+    dedupe = "parity_matrix_min_dept"
 
     if regenerate or not dataset_path.is_file():
         edge_index_cpu = bidirectional_ring_edge_index(n_ring, device=torch.device("cpu"))
@@ -448,6 +512,15 @@ def train_imitation_demo(
         f"|train|={len(train_samples)}  |test|={len(test_samples)}"
     )
 
+    train_valid = valid_edges_frozenset_by_matrix(train_samples)
+    test_valid = valid_edges_frozenset_by_matrix(test_samples)
+    nmt, amb_tr = label_ambiguity_stats(train_samples)
+    nmv, amb_te = label_ambiguity_stats(test_samples)
+    print(
+        f"  multi-valid-edge matrices  train={amb_tr}/{nmt}  test={amb_te}/{nmv}  "
+        f"(same-matrix multi-action counts)"
+    )
+
     model = ImitationPolicy(
         n_qubits=n,
         edge_index=edge_index,
@@ -469,15 +542,10 @@ def train_imitation_demo(
         for start in range(0, len(train_samples), batch_size):
             idx = perm[start : start + batch_size]
             batch_cur = torch.stack([train_samples[i][0] for i in idx]).to(resolved)
-            batch_y = torch.tensor(
-                [train_samples[i][1] for i in idx],
-                device=resolved,
-                dtype=torch.long,
-            )
             opt.zero_grad(set_to_none=True)
             with autocast(enabled=use_amp_eff):
                 logits = model.forward_batched(batch_cur)
-                loss = behaviour_cloning_loss_batched(logits, batch_y)
+                loss = behaviour_cloning_loss_multi_valid(logits, batch_cur, train_valid)
             if use_amp_eff:
                 scaler.scale(loss).backward()
                 scaler.step(opt)
@@ -488,11 +556,19 @@ def train_imitation_demo(
             total_loss += loss.item()
             n_batches += 1
 
-        acc_tr = edge_classification_accuracy(
-            model, train_samples, resolved, batch_size=eval_batch_size
+        acc_tr = edge_classification_accuracy_multi(
+            model,
+            train_samples,
+            resolved,
+            train_valid,
+            batch_size=eval_batch_size,
         )
-        acc_te = edge_classification_accuracy(
-            model, test_samples, resolved, batch_size=eval_batch_size
+        acc_te = edge_classification_accuracy_multi(
+            model,
+            test_samples,
+            resolved,
+            test_valid,
+            batch_size=eval_batch_size,
         )
         avg_loss = total_loss / max(n_batches, 1)
         completed_epochs = ep + 1
@@ -516,11 +592,19 @@ def train_imitation_demo(
             stopped_early = True
             break
 
-    final_acc_train = edge_classification_accuracy(
-        model, train_samples, resolved, batch_size=eval_batch_size
+    final_acc_train = edge_classification_accuracy_multi(
+        model,
+        train_samples,
+        resolved,
+        train_valid,
+        batch_size=eval_batch_size,
     )
-    final_acc_test = edge_classification_accuracy(
-        model, test_samples, resolved, batch_size=eval_batch_size
+    final_acc_test = edge_classification_accuracy_multi(
+        model,
+        test_samples,
+        resolved,
+        test_valid,
+        batch_size=eval_batch_size,
     )
     print("---")
     print(

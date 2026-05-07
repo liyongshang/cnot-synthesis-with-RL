@@ -16,6 +16,11 @@
 
 from __future__ import annotations
 
+import os
+
+# Windows 上常见：PyTorch 与 Matplotlib 等各自链接 OpenMP，运行时报 OMP: Error #15。
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import argparse
 import sys
 from pathlib import Path

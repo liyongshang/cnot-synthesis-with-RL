@@ -14,6 +14,7 @@ import torch
 
 from deterministic_samples import (
     dataset_parity_stats,
+    label_ambiguity_stats,
     make_deterministic_label_samples,
     save_deterministic_dataset,
 )
@@ -46,7 +47,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--dedupe",
-        choices=["none", "parity_matrix", "parity_and_edge"],
+        choices=["none", "parity_matrix", "parity_and_edge", "parity_matrix_min_depth"],
         default="parity_matrix",
     )
     parser.add_argument(
@@ -115,8 +116,10 @@ def main() -> None:
     )
 
     ns, nu = dataset_parity_stats(samples)
+    n_mat_amb, n_conflict = label_ambiguity_stats(samples)
     print(f"wrote {out_path}")
     print(f"  topology={args.topology}  samples={ns}  unique_parity_matrices={nu}  E={e_cnt}  walk_length={L}")
+    print(f"  dedupe_mode={args.dedupe}  matrices_with_multi_edge_labels={n_conflict}/{n_mat_amb}")
     if not enumerate_all:
         print(f"  random_trajectories={args.num_random_trajectories}  seed={args.seed}")
 
