@@ -346,6 +346,11 @@ def matrix_class_ids_and_valid_mask(
     将样本行的 parity 映射到类别 id ``0..U-1``，并构造 ``valid_mask_ec[u,e]``。
     返回 ``mids_cpu`` (CPU long [N])、``valid_mask_ec`` (device bool [U,E])。
     """
+    if not samples:
+        empty = torch.empty(0, dtype=torch.long)
+        if device.type == "cuda":
+            empty = empty.pin_memory()
+        return empty, torch.zeros(0, num_edges, dtype=torch.bool, device=device)
     pk_to_id: dict[tuple[int, ...], int] = {}
     mids_list: list[int] = []
     for p, _ in samples:
@@ -390,16 +395,20 @@ def split_train_test(
     train_ratio: float,
     seed: int,
 ) -> tuple[list[tuple[torch.Tensor, int]], list[tuple[torch.Tensor, int]]]:
-    """随机打乱后按比例划分训练集 / 测试集（用于泛化评估）。"""
-    if not (0.0 < train_ratio < 1.0):
-        raise ValueError("train_ratio must be in (0, 1)")
+    """随机打乱后按比例划分训练集 / 测试集（用于泛化评估）。``train_ratio=1`` 时测试集为空。"""
+    if not (0.0 < train_ratio <= 1.0):
+        raise ValueError("train_ratio must be in (0, 1]")
     n = len(samples)
-    if n < 2:
-        raise ValueError("need at least 2 samples to split")
+    if n < 1:
+        raise ValueError("need at least 1 sample")
     g = torch.Generator()
     g.manual_seed(seed)
     perm = torch.randperm(n, generator=g).tolist()
     shuffled = [samples[i] for i in perm]
+    if train_ratio >= 1.0:
+        return shuffled, []
+    if n < 2:
+        raise ValueError("need at least 2 samples when train_ratio < 1")
     # e.g. n=71, ratio=0.9 -> round(63.9)=64 train, 7 test
     n_train = max(1, min(int(round(n * train_ratio)), n - 1))
     train_samples = shuffled[:n_train]
@@ -535,6 +544,7 @@ def train_imitation_demo(
 
     split_s = split_seed if split_seed is not None else seed + 2025
     train_samples, test_samples = split_train_test(ring_samples, train_ratio, split_s)
+    has_test = len(test_samples) > 0
     print(
         f"train/test split  ratio={train_ratio:.0%}  seed={split_s}  "
         f"|train|={len(train_samples)}  |test|={len(test_samples)}"
@@ -550,10 +560,14 @@ def train_imitation_demo(
     )
 
     train_mats_cpu = torch.stack([p for p, _ in train_samples])
-    test_mats_cpu = torch.stack([p for p, _ in test_samples])
+    if has_test:
+        test_mats_cpu = torch.stack([p for p, _ in test_samples])
+    else:
+        test_mats_cpu = torch.empty(0, n, n, dtype=torch.float32)
     if resolved.type == "cuda":
         train_mats_cpu = train_mats_cpu.pin_memory()
-        test_mats_cpu = test_mats_cpu.pin_memory()
+        if has_test:
+            test_mats_cpu = test_mats_cpu.pin_memory()
     train_mids_cpu, train_mask_gpu = matrix_class_ids_and_valid_mask(
         train_samples, train_valid, e_cnt, resolved
     )
@@ -624,23 +638,27 @@ def train_imitation_demo(
                 resolved,
                 batch_size=eval_batch_size,
             )
-            acc_te = edge_classification_accuracy_multi(
-                model,
-                test_mats_gpu,
-                test_mids_cpu,
-                test_mask_gpu,
-                resolved,
-                batch_size=eval_batch_size,
-            )
+            if has_test:
+                acc_te = edge_classification_accuracy_multi(
+                    model,
+                    test_mats_gpu,
+                    test_mids_cpu,
+                    test_mask_gpu,
+                    resolved,
+                    batch_size=eval_batch_size,
+                )
+            else:
+                acc_te = float("nan")
             last_acc_tr, last_acc_te = acc_tr, acc_te
         else:
             acc_tr, acc_te = last_acc_tr, last_acc_te
 
         if completed_epochs % 10 == 0 or ep == 0:
             if do_eval:
+                te_str = f"{acc_te:.3f}" if has_test else "n/a"
                 print(
                     f"epoch {completed_epochs}/{max_epochs}  loss={avg_loss:.4f}  "
-                    f"acc_train={acc_tr:.3f}  acc_test={acc_te:.3f}"
+                    f"acc_train={acc_tr:.3f}  acc_test={te_str}"
                 )
             else:
                 print(
@@ -653,12 +671,13 @@ def train_imitation_demo(
             and do_eval
             and completed_epochs >= min_epochs
             and acc_tr >= stop_acc_train
-            and acc_te >= stop_acc_test
+            and (not has_test or acc_te >= stop_acc_test)
         ):
+            te_str = f"{acc_te:.3f}>={stop_acc_test}" if has_test else "no test split"
             print(
                 f"early stop at epoch {completed_epochs}: "
                 f"acc_train={acc_tr:.3f}>={stop_acc_train}  "
-                f"acc_test={acc_te:.3f}>={stop_acc_test}"
+                f"acc_test {te_str}"
             )
             stopped_early = True
             break
@@ -671,17 +690,22 @@ def train_imitation_demo(
         resolved,
         batch_size=eval_batch_size,
     )
-    final_acc_test = edge_classification_accuracy_multi(
-        model,
-        test_mats_gpu,
-        test_mids_cpu,
-        test_mask_gpu,
-        resolved,
-        batch_size=eval_batch_size,
+    final_acc_test = (
+        edge_classification_accuracy_multi(
+            model,
+            test_mats_gpu,
+            test_mids_cpu,
+            test_mask_gpu,
+            resolved,
+            batch_size=eval_batch_size,
+        )
+        if has_test
+        else float("nan")
     )
     print("---")
+    te_fin = f"{final_acc_test:.3f}" if has_test else "n/a"
     print(
-        f"final acc_train={final_acc_train:.3f}  acc_test={final_acc_test:.3f}  "
+        f"final acc_train={final_acc_train:.3f}  acc_test={te_fin}  "
         f"(walk_length={walk_meta}, epochs={completed_epochs}"
         f"{' early_stop' if stopped_early else ''})"
     )
@@ -697,7 +721,9 @@ def train_imitation_demo(
         extra_meta={
             "dataset_path": str(dataset_path),
             "final_acc_train": float(final_acc_train),
-            "final_acc_test": float(final_acc_test),
+            "final_acc_test": (
+                float(final_acc_test) if has_test else None
+            ),
             "train_ratio": float(train_ratio),
             "split_seed": int(split_s),
             "walk_length": walk_meta,
@@ -737,7 +763,7 @@ if __name__ == "__main__":
         "--train-ratio",
         type=float,
         default=0.9,
-        help="fraction of samples for training (rest for test generalization)",
+        help="训练集占比 (0,1]；为 1 时不用测试集，早停仅看 acc_train",
     )
     parser.add_argument(
         "--split-seed",
