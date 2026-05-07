@@ -559,9 +559,9 @@ def train_imitation_demo(
         f"(same-matrix multi-action counts)"
     )
 
-    train_mats_cpu = torch.stack([p for p, _ in train_samples])
+    train_mats_cpu = torch.stack([p for p, _ in train_samples]).detach().cpu().contiguous()
     if has_test:
-        test_mats_cpu = torch.stack([p for p, _ in test_samples])
+        test_mats_cpu = torch.stack([p for p, _ in test_samples]).detach().cpu().contiguous()
     else:
         test_mats_cpu = torch.empty(0, n, n, dtype=torch.float32)
     if resolved.type == "cuda":
