@@ -336,28 +336,53 @@ def valid_edges_frozenset_by_matrix(
     return {k: frozenset(v) for k, v in g.items()}
 
 
+def matrix_class_ids_and_valid_mask(
+    samples: list[tuple[torch.Tensor, int]],
+    valid_by_pk: dict[tuple[int, ...], frozenset[int]],
+    num_edges: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    将样本行的 parity 映射到类别 id ``0..U-1``，并构造 ``valid_mask_ec[u,e]``。
+    返回 ``mids_cpu`` (CPU long [N])、``valid_mask_ec`` (device bool [U,E])。
+    """
+    pk_to_id: dict[tuple[int, ...], int] = {}
+    mids_list: list[int] = []
+    for p, _ in samples:
+        pk = parity_matrix_key(p)
+        if pk not in pk_to_id:
+            pk_to_id[pk] = len(pk_to_id)
+        mids_list.append(pk_to_id[pk])
+    u = len(pk_to_id)
+    mask = torch.zeros(u, num_edges, dtype=torch.bool, device=device)
+    for pk, es in valid_by_pk.items():
+        rid = pk_to_id.get(pk)
+        if rid is None:
+            continue
+        for e in es:
+            ei = int(e)
+            if 0 <= ei < num_edges:
+                mask[rid, ei] = True
+    mids_cpu = torch.tensor(mids_list, dtype=torch.long)
+    if device.type == "cuda":
+        mids_cpu = mids_cpu.pin_memory()
+    return mids_cpu, mask
+
+
 def behaviour_cloning_loss_multi_valid(
     logits: torch.Tensor,
-    parity_batch: torch.Tensor,
-    valid_by_pk: dict[tuple[int, ...], frozenset[int]],
+    batch_matrix_ids: torch.Tensor,
+    valid_mask_ec: torch.Tensor,
 ) -> torch.Tensor:
     """
-    多个合法边时：最大化 ``sum_{e in Valid(P)} softmax(z)_e``（任一合法即可），
-    即最小化 ``-(logsumexp(z_V) - logsumexp(z))``。
-    若某矩阵仅一条合法边，退化为普通交叉熵。
+    向量化：``batch_matrix_ids`` [B] 对应 ``valid_mask_ec[u,e]`` 的行。
+    最小化 ``-(logsumexp(z_V) - logsumexp(z))``。
     """
     z = logits.squeeze(-1)
-    device = z.device
-    B = z.size(0)
-    parts: list[torch.Tensor] = []
-    for i in range(B):
-        pk = parity_matrix_key(parity_batch[i])
-        valid = valid_by_pk[pk]
-        idx = torch.tensor(sorted(valid), device=device, dtype=torch.long)
-        logz_all = torch.logsumexp(z[i], dim=0)
-        logz_v = torch.logsumexp(z[i].index_select(0, idx), dim=0)
-        parts.append(-(logz_v - logz_all))
-    return torch.stack(parts).mean()
+    m = valid_mask_ec[batch_matrix_ids]
+    z_v = torch.logsumexp(z.masked_fill(~m, float("-inf")), dim=-1)
+    z_all = torch.logsumexp(z, dim=-1)
+    return -(z_v - z_all).mean()
 
 
 def split_train_test(
@@ -406,26 +431,27 @@ def edge_classification_accuracy(
 @torch.no_grad()
 def edge_classification_accuracy_multi(
     model: ImitationPolicy,
-    samples: list[tuple[torch.Tensor, int]],
+    parity_block: torch.Tensor,
+    mids_cpu: torch.Tensor,
+    valid_mask_ec: torch.Tensor,
     device: torch.device,
-    valid_by_pk: dict[tuple[int, ...], frozenset[int]],
     batch_size: int = 512,
 ) -> float:
-    """预测边属于该 parity 在集合中的任一边即判对。"""
-    n = len(samples)
+    """``parity_block`` [N,N,N] 与 ``mids_cpu`` [N] 对齐；预测边落在对应 mask 行即判对。"""
+    n = int(parity_block.size(0))
     if n == 0:
         return 0.0
+    model.eval()
     correct = 0
     for start in range(0, n, batch_size):
-        chunk = samples[start : start + batch_size]
-        cur = torch.stack([c for c, _ in chunk]).to(device)
+        end = min(start + batch_size, n)
+        cur = parity_block[start:end]
+        mid = mids_cpu[start:end].to(device=device, non_blocking=True)
         logits = model.forward_batched(cur)
         pred = logits.squeeze(-1).argmax(dim=-1)
-        for j in range(cur.size(0)):
-            pk = parity_matrix_key(cur[j])
-            valid = valid_by_pk.get(pk, frozenset())
-            if int(pred[j].item()) in valid:
-                correct += 1
+        m = valid_mask_ec[mid]
+        ok = m[torch.arange(cur.size(0), device=device), pred]
+        correct += int(ok.sum().item())
     return correct / n
 
 
@@ -454,6 +480,7 @@ def train_imitation_demo(
     batch_size: int = 128,
     use_amp: bool = True,
     eval_batch_size: int = 512,
+    eval_every_epochs: int = 5,
 ) -> None:
     torch.manual_seed(seed)
     resolved = _resolve_training_device(device)
@@ -462,7 +489,7 @@ def train_imitation_demo(
     n_ring = 5
     walk_len = 2
     obs_mode = "post_action"
-    dedupe = "parity_matrix_min_dept"
+    dedupe = "parity_matrix_min_depth"
 
     if regenerate or not dataset_path.is_file():
         edge_index_cpu = bidirectional_ring_edge_index(n_ring, device=torch.device("cpu"))
@@ -500,6 +527,7 @@ def train_imitation_demo(
     print(f"loaded dataset {dataset_path}")
     print(
         f"  device={resolved}  batch_size={batch_size}  amp={use_amp_eff}  "
+        f"eval_every={eval_every_epochs}  "
         f"E={e_cnt}  n_qubits={n}  walk_length={walk_meta}"
     )
     print(f"  samples={n_s}  unique_matrices={n_u}")
@@ -521,6 +549,20 @@ def train_imitation_demo(
         f"(same-matrix multi-action counts)"
     )
 
+    train_mats_cpu = torch.stack([p for p, _ in train_samples])
+    test_mats_cpu = torch.stack([p for p, _ in test_samples])
+    if resolved.type == "cuda":
+        train_mats_cpu = train_mats_cpu.pin_memory()
+        test_mats_cpu = test_mats_cpu.pin_memory()
+    train_mids_cpu, train_mask_gpu = matrix_class_ids_and_valid_mask(
+        train_samples, train_valid, e_cnt, resolved
+    )
+    test_mids_cpu, test_mask_gpu = matrix_class_ids_and_valid_mask(
+        test_samples, test_valid, e_cnt, resolved
+    )
+    train_mats_gpu = train_mats_cpu.to(resolved, non_blocking=True)
+    test_mats_gpu = test_mats_cpu.to(resolved, non_blocking=True)
+
     model = ImitationPolicy(
         n_qubits=n,
         edge_index=edge_index,
@@ -529,23 +571,32 @@ def train_imitation_demo(
         hidden_dim=64,
         num_layers=3,
     ).to(resolved)
+    if resolved.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     opt = torch.optim.Adam(model.parameters(), lr=3e-3)
 
     stopped_early = False
     completed_epochs = 0
     shuf = torch.Generator(device="cpu")
+    last_acc_tr = 0.0
+    last_acc_te = 0.0
     for ep in range(max_epochs):
         shuf.manual_seed(seed + ep * 10007)
         perm = torch.randperm(len(train_samples), generator=shuf).tolist()
         total_loss = 0.0
         n_batches = 0
-        for start in range(0, len(train_samples), batch_size):
+        n_train = len(train_samples)
+        for start in range(0, n_train, batch_size):
             idx = perm[start : start + batch_size]
-            batch_cur = torch.stack([train_samples[i][0] for i in idx]).to(resolved)
+            idx_t = torch.tensor(idx, dtype=torch.long, device=resolved)
+            batch_cur = train_mats_gpu.index_select(0, idx_t)
+            batch_mids = train_mids_cpu[idx].to(resolved, non_blocking=True)
             opt.zero_grad(set_to_none=True)
+            model.train()
             with autocast(enabled=use_amp_eff):
                 logits = model.forward_batched(batch_cur)
-                loss = behaviour_cloning_loss_multi_valid(logits, batch_cur, train_valid)
+                loss = behaviour_cloning_loss_multi_valid(logits, batch_mids, train_mask_gpu)
             if use_amp_eff:
                 scaler.scale(loss).backward()
                 scaler.step(opt)
@@ -556,30 +607,50 @@ def train_imitation_demo(
             total_loss += loss.item()
             n_batches += 1
 
-        acc_tr = edge_classification_accuracy_multi(
-            model,
-            train_samples,
-            resolved,
-            train_valid,
-            batch_size=eval_batch_size,
-        )
-        acc_te = edge_classification_accuracy_multi(
-            model,
-            test_samples,
-            resolved,
-            test_valid,
-            batch_size=eval_batch_size,
-        )
         avg_loss = total_loss / max(n_batches, 1)
         completed_epochs = ep + 1
-        if completed_epochs % 10 == 0 or ep == 0:
-            print(
-                f"epoch {completed_epochs}/{max_epochs}  loss={avg_loss:.4f}  "
-                f"acc_train={acc_tr:.3f}  acc_test={acc_te:.3f}"
+        do_eval = (
+            eval_every_epochs <= 1
+            or completed_epochs % eval_every_epochs == 0
+            or ep == 0
+            or ep == max_epochs - 1
+        )
+        if do_eval:
+            acc_tr = edge_classification_accuracy_multi(
+                model,
+                train_mats_gpu,
+                train_mids_cpu,
+                train_mask_gpu,
+                resolved,
+                batch_size=eval_batch_size,
             )
+            acc_te = edge_classification_accuracy_multi(
+                model,
+                test_mats_gpu,
+                test_mids_cpu,
+                test_mask_gpu,
+                resolved,
+                batch_size=eval_batch_size,
+            )
+            last_acc_tr, last_acc_te = acc_tr, acc_te
+        else:
+            acc_tr, acc_te = last_acc_tr, last_acc_te
+
+        if completed_epochs % 10 == 0 or ep == 0:
+            if do_eval:
+                print(
+                    f"epoch {completed_epochs}/{max_epochs}  loss={avg_loss:.4f}  "
+                    f"acc_train={acc_tr:.3f}  acc_test={acc_te:.3f}"
+                )
+            else:
+                print(
+                    f"epoch {completed_epochs}/{max_epochs}  loss={avg_loss:.4f}  "
+                    f"(skip eval, eval_every={eval_every_epochs})"
+                )
 
         if (
             early_stop
+            and do_eval
             and completed_epochs >= min_epochs
             and acc_tr >= stop_acc_train
             and acc_te >= stop_acc_test
@@ -594,16 +665,18 @@ def train_imitation_demo(
 
     final_acc_train = edge_classification_accuracy_multi(
         model,
-        train_samples,
+        train_mats_gpu,
+        train_mids_cpu,
+        train_mask_gpu,
         resolved,
-        train_valid,
         batch_size=eval_batch_size,
     )
     final_acc_test = edge_classification_accuracy_multi(
         model,
-        test_samples,
+        test_mats_gpu,
+        test_mids_cpu,
+        test_mask_gpu,
         resolved,
-        test_valid,
         batch_size=eval_batch_size,
     )
     print("---")
@@ -633,6 +706,7 @@ def train_imitation_demo(
             "max_epochs": int(max_epochs),
             "train_batch_size": int(batch_size),
             "eval_batch_size": int(eval_batch_size),
+            "eval_every_epochs": int(eval_every_epochs),
             "device": str(resolved),
             "use_amp": bool(use_amp_eff),
         },
@@ -714,6 +788,13 @@ if __name__ == "__main__":
         help="评估准确率时的 batch 大小",
     )
     parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=5,
+        dest="eval_every",
+        help="每多少个 epoch 做一次 train/test 准确率评估（默认 5，设为 1 则每轮都评，慢）",
+    )
+    parser.add_argument(
         "--no-amp",
         action="store_true",
         help="关闭 CUDA 混合精度（默认在 CUDA 上开启 autocast + GradScaler）",
@@ -736,5 +817,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         use_amp=not args.no_amp,
         eval_batch_size=args.eval_batch_size,
+        eval_every_epochs=args.eval_every,
     )
 
